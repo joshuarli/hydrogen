@@ -43,6 +43,11 @@ u64 allocate_fd(process p, void *f, u32 fd_flags)
         msg_err("fd allocation failed");
         goto out;
     }
+    if (p->rlimit_nofile_cur && fd >= p->rlimit_nofile_cur) {
+        deallocate_u64((heap)fdt->fdallocator, fd, 1);
+        fd = INVALID_PHYSICAL;
+        goto out;
+    }
     if (!vector_set(fdt->files, fd, f)) {
         deallocate_u64((heap)fdt->fdallocator, fd, 1);
         fd = INVALID_PHYSICAL;
@@ -59,6 +64,10 @@ u64 allocate_fd_gte(process p, u64 min, void *f, u32 fd_flags)
     fdtable fdt = p->fdtable;
     spin_lock(&fdt->lock);
     u64 fd = id_heap_alloc_gte(fdt->fdallocator, 1, min);
+    if (fd != INVALID_PHYSICAL && p->rlimit_nofile_cur && fd >= p->rlimit_nofile_cur) {
+        deallocate_u64((heap)fdt->fdallocator, fd, 1);
+        fd = INVALID_PHYSICAL;
+    }
     if (fd == INVALID_PHYSICAL) {
         msg_err("fd allocation failed");
     }
@@ -778,6 +787,7 @@ static process process_alloc(unix_heaps uh, tuple root, filesystem fs, int pid)
     p->wait_status = 0;
     p->cutime = p->cstime = 0;
     p->rlimit_nproc_cur = p->rlimit_nproc_max = default_rlimit_nproc();
+    p->rlimit_nofile_cur = p->rlimit_nofile_max = 65536;
     p->vfork_waiter = 0;
     p->exec_thread = 0;
     p->exec_waiter = 0;
@@ -945,6 +955,8 @@ sysreturn fork_process(thread t, struct clone_args_internal *args)
     c->rlimit_stack = parent->rlimit_stack;
     c->rlimit_nproc_cur = parent->rlimit_nproc_cur;
     c->rlimit_nproc_max = parent->rlimit_nproc_max;
+    c->rlimit_nofile_cur = parent->rlimit_nofile_cur;
+    c->rlimit_nofile_max = parent->rlimit_nofile_max;
     c->trace = parent->trace;
     runtime_memcpy(c->sigactions, parent->sigactions, sizeof(c->sigactions));
     runtime_memcpy(c->saved_aux, parent->saved_aux, sizeof(c->saved_aux));

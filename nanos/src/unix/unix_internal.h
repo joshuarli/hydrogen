@@ -125,6 +125,7 @@ static inline boolean wait_status_is_exit(int status)
 }
 
 int process_getppid(process p);
+int process_visible_pid(process target, process viewer);
 sysreturn process_signal(process sender, int pid, struct siginfo *si);
 struct rusage;
 sysreturn process_wait(int idtype, int id, int options, int *wstatus, struct siginfo *infop,
@@ -633,6 +634,7 @@ typedef struct process {
     timestamp         cutime, cstime;
     blockq            child_bq;
     u64               rlimit_nproc_cur, rlimit_nproc_max;
+    u64               rlimit_nofile_cur, rlimit_nofile_max;
     thread            vfork_waiter;
     boolean           exiting;
     boolean           dumpable;

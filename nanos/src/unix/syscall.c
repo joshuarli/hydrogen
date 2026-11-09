@@ -1794,6 +1794,16 @@ sysreturn setrlimit(int resource, const struct rlimit *rlim)
             p->rlimit_nproc_max = rlim->rlim_max;
         }
         break;
+    case RLIMIT_NOFILE:
+        if (rlim->rlim_cur > rlim->rlim_max)
+            rv = -EINVAL;
+        else if ((rlim->rlim_max > p->rlimit_nofile_max) && !capable(p, CAP_SYS_RESOURCE))
+            rv = -EPERM;
+        else {
+            p->rlimit_nofile_cur = rlim->rlim_cur;
+            p->rlimit_nofile_max = rlim->rlim_max;
+        }
+        break;
     }
     context_clear_err(ctx);
     return rv;
@@ -1820,9 +1830,8 @@ sysreturn getrlimit(int resource, struct rlimit *rlim)
         rlim->rlim_cur = rlim->rlim_max = 0;    // core dump not supported
         break;
     case RLIMIT_NOFILE:
-        // we .. .dont really have one?
-        rlim->rlim_cur = 65536;
-        rlim->rlim_max = 65536;
+        rlim->rlim_cur = current->p->rlimit_nofile_cur;
+        rlim->rlim_max = current->p->rlimit_nofile_max;
         break;
     case RLIMIT_AS:
         rlim->rlim_cur = rlim->rlim_max = heap_total(current->p->vm->virtual);

@@ -3,10 +3,61 @@
 #include <net_system_structs.h>
 #include <socket.h>
 
+typedef struct unix_cred {
+    process p;
+    u32 uid, gid;
+} *unix_cred;
+
+typedef struct unixsock_scm {
+    struct unix_cred cred;
+    boolean has_cred;
+    u16 nfds;
+    fdesc fds[];
+} *unixsock_scm;
+
 typedef struct unixsock_msg {
     buffer b;
     struct sockaddr_un from_addr;
+    unixsock_scm scm;
 } *unixsock_msg;
+
+#ifndef SCM_RIGHTS
+#define SCM_RIGHTS      1
+#endif
+#ifndef SCM_CREDENTIALS
+#define SCM_CREDENTIALS 2
+#endif
+#ifndef SO_PASSCRED
+#define SO_PASSCRED     16
+#endif
+#ifndef SO_PEERCRED
+#define SO_PEERCRED     17
+#endif
+#ifndef MSG_CTRUNC
+#define MSG_CTRUNC      0x00000008
+#endif
+#ifndef MSG_CMSG_CLOEXEC
+#define MSG_CMSG_CLOEXEC 0x40000000
+#endif
+
+#define SCM_MAX_FD      253
+
+typedef struct unix_cmsghdr {
+    u32 cmsg_len;
+    u32 __pad1;
+    s32 cmsg_level;
+    s32 cmsg_type;
+} unix_cmsghdr;
+
+typedef struct unix_ucred {
+    s32 pid;
+    u32 uid;
+    u32 gid;
+} unix_ucred;
+
+#define SCM_CMSG_ALIGN(len)   (((len) + 7ull) & ~7ull)
+#define SCM_CMSG_SPACE(len)   (SCM_CMSG_ALIGN(sizeof(unix_cmsghdr)) + SCM_CMSG_ALIGN(len))
+#define SCM_CMSG_LEN(len)     (SCM_CMSG_ALIGN(sizeof(unix_cmsghdr)) + (len))
 
 #define UNIXSOCK_BUF_MAX_SIZE   PAGESIZE
 #define UNIXSOCK_QUEUE_MAX_LEN  64
@@ -24,6 +75,8 @@ typedef struct unixsock {
     queue conn_q;
     struct unixsock *peer;
     u8 shutdown;
+    boolean passcred;
+    struct unix_cred peercred;
     notify_entry notify_handle;
     closure_struct(file_io, read);
     closure_struct(file_io, write);
@@ -40,9 +93,33 @@ typedef struct unixsock {
 #define unixsock_lock(s)    spin_lock(&(s)->sock.f.lock)
 #define unixsock_unlock(s)  spin_unlock(&(s)->sock.f.lock)
 
+int process_visible_pid(process target, process viewer)
+{
+    (void)viewer;
+    if (!target || target->pid <= 0)
+        return 0;
+    return target->pid;
+}
+
+static void scm_release(unixsock_scm scm)
+{
+    if (!scm)
+        return;
+    for (u16 i = 0; i < scm->nfds; i++)
+        fdesc_put(scm->fds[i]);
+    if (scm->has_cred && scm->cred.p)
+        process_release(scm->cred.p);
+    heap h = heap_locked(get_kernel_heaps());
+    deallocate(h, scm, sizeof(*scm) + scm->nfds * sizeof(fdesc));
+}
+
 static inline void unixsock_msg_dealloc(unixsock_msg shb)
 {
     heap h = shb->b->h;
+    if (shb->scm) {
+        scm_release(shb->scm);
+        shb->scm = 0;
+    }
     deallocate_buffer(shb->b);
     deallocate(h, shb, sizeof(*shb));
 }
@@ -77,13 +154,33 @@ closure_func_basic(event_handler, u64, unixsock_event_handler,
 closure_func_basic(thunk, void, unixsock_free)
 {
     unixsock s = struct_from_closure(unixsock, free);
+    if (s->peercred.p)
+        process_release(s->peercred.p);
     socket_deinit(&s->sock);
     deallocate(s->sock.h, s, sizeof(*s));
 }
 
+static void unixsock_peercred_set(unixsock s, process p, u32 uid, u32 gid)
+{
+    if (s->peercred.p)
+        process_release(s->peercred.p);
+    s->peercred.p = p;
+    if (p)
+        process_reserve(p);
+    s->peercred.uid = uid;
+    s->peercred.gid = gid;
+}
+
+static void unixsock_peercred_set_current(unixsock s, process p)
+{
+    struct creds c;
+    creds_snapshot(p, &c);
+    unixsock_peercred_set(s, p, c.euid, c.egid);
+}
+
 static unixsock_msg unixsock_msg_alloc(heap h, u64 len)
 {
-    unixsock_msg shb = allocate(h, sizeof(*shb));
+    unixsock_msg shb = allocate_zero(h, sizeof(*shb));
     if (shb == INVALID_ADDRESS)
         return shb;
     shb->b = allocate_buffer(h, len);
@@ -118,9 +215,25 @@ static unixsock unixsock_alloc(heap h, int type, u32 flags, boolean alloc_fd);
 /* Called with lock acquired, returns with lock released. */
 static void unixsock_dealloc(unixsock s)
 {
-    deallocate_queue(s->data);
-    s->data = 0;
+    heap locked = heap_locked(get_kernel_heaps());
+    vector drained = allocate_vector(locked, 8);
+    if (drained != INVALID_ADDRESS && s->data) {
+        unixsock_msg shb;
+        while ((shb = dequeue(s->data)) != INVALID_ADDRESS)
+            vector_push(drained, shb);
+        deallocate_queue(s->data);
+        s->data = 0;
+    } else {
+        deallocate_queue(s->data);
+        s->data = 0;
+    }
     unixsock_unlock(s);
+    if (drained != INVALID_ADDRESS) {
+        unixsock_msg shb;
+        vector_foreach(drained, shb)
+            unixsock_msg_dealloc(shb);
+        deallocate_vector(drained);
+    }
     unixsock peer = unixsock_is_conn_oriented(s) ? s->peer : 0;
     if (peer) {
         blockq_flush(peer->sock.rxbq);
@@ -147,6 +260,317 @@ static inline void unixsock_notify_writer(unixsock s)
     fdesc_notify_events(&s->sock.f);
 }
 
+static sysreturn scm_parse(const struct msghdr *m, unixsock sender, unixsock dest, unixsock_scm *out)
+{
+    *out = 0;
+    process sender_p;
+    if (!sender)
+        return -EBADF;
+    thread cur = get_current_thread();
+    if (!cur)
+        return -ESRCH;
+    sender_p = cur->p;
+    u64 controllen = 0;
+    void *control = 0;
+    if (m) {
+        control = m->msg_control;
+        controllen = m->msg_controllen;
+        if (controllen > 2147483647ull)
+            return -ENOBUFS;
+    }
+    fdesc tmp_fds[SCM_MAX_FD];
+    u16 tmp_nfds = 0;
+    boolean has_explicit = false;
+    unix_ucred explicit = { 0, 0, 0 };
+    process explicit_p = 0;
+    sysreturn parse_err = 0;
+    context ctx = get_current_context(current_cpu());
+    if (context_set_err(ctx)) {
+        for (u16 i = 0; i < tmp_nfds; i++)
+            fdesc_put(tmp_fds[i]);
+        if (explicit_p)
+            process_release(explicit_p);
+        return -EFAULT;
+    }
+    if (control && controllen) {
+        u64 off = 0;
+        while (off < controllen && !parse_err) {
+            if (off + sizeof(unix_cmsghdr) > controllen)
+                break;
+            u8 *cp = (u8 *)control + off;
+            u32 cmsg_len = *(u32 *)cp;
+            s32 level = *(s32 *)(cp + 8);
+            s32 type = *(s32 *)(cp + 12);
+            if (cmsg_len < sizeof(unix_cmsghdr) || cmsg_len > controllen - off) {
+                parse_err = -EINVAL;
+                break;
+            }
+            if (level != SOL_SOCKET) {
+            } else if (type == SCM_RIGHTS) {
+                u64 data_len = cmsg_len - sizeof(unix_cmsghdr);
+                if (data_len % sizeof(int)) {
+                    parse_err = -EINVAL;
+                    break;
+                }
+                u64 count = data_len / sizeof(int);
+                if (tmp_nfds + count > SCM_MAX_FD) {
+                    parse_err = -EINVAL;
+                    break;
+                }
+                for (u64 i = 0; i < count; i++) {
+                    int fd = *(int *)(cp + sizeof(unix_cmsghdr) + i * sizeof(int));
+                    fdesc f = fdesc_get(sender_p, fd);
+                    if (!f) {
+                        parse_err = -EBADF;
+                        break;
+                    }
+                    tmp_fds[tmp_nfds++] = f;
+                }
+            } else if (type == SCM_CREDENTIALS) {
+                if (cmsg_len < sizeof(unix_cmsghdr) + sizeof(unix_ucred)) {
+                    parse_err = -EINVAL;
+                    break;
+                }
+                u8 *data = cp + sizeof(unix_cmsghdr);
+                unix_ucred uc;
+                uc.pid = *(s32 *)data;
+                uc.uid = *(u32 *)(data + 4);
+                uc.gid = *(u32 *)(data + 8);
+                struct creds scon;
+                creds_snapshot(sender_p, &scon);
+                boolean is_admin = capable(sender_p, CAP_SYS_ADMIN);
+                if (uc.pid != sender_p->pid && !is_admin) {
+                    parse_err = -EPERM;
+                    break;
+                }
+                boolean uid_ok = (uc.uid == scon.uid || uc.uid == scon.euid || uc.uid == scon.suid);
+                boolean uid_priv = is_admin || capable(sender_p, CAP_SETUID);
+                if (!uid_ok && !uid_priv) {
+                    parse_err = -EPERM;
+                    break;
+                }
+                boolean gid_ok = (uc.gid == scon.gid || uc.gid == scon.egid || uc.gid == scon.sgid);
+                boolean gid_priv = is_admin || capable(sender_p, CAP_SETGID);
+                if (!gid_ok && !gid_priv) {
+                    parse_err = -EPERM;
+                    break;
+                }
+                if (has_explicit && explicit_p)
+                    process_release(explicit_p);
+                explicit = uc;
+                has_explicit = true;
+                if (uc.pid == sender_p->pid) {
+                    explicit_p = sender_p;
+                    process_reserve(explicit_p);
+                } else {
+                    process p2 = process_get(uc.pid);
+                    explicit_p = p2;
+                }
+            } else {
+                parse_err = -EINVAL;
+                break;
+            }
+            u64 adv = (cmsg_len + 7ull) & ~7ull;
+            if (!adv) {
+                parse_err = -EINVAL;
+                break;
+            }
+            off += adv;
+        }
+    }
+    context_clear_err(ctx);
+    if (parse_err) {
+        for (u16 i = 0; i < tmp_nfds; i++)
+            fdesc_put(tmp_fds[i]);
+        if (explicit_p)
+            process_release(explicit_p);
+        return parse_err;
+    }
+    if (!has_explicit) {
+        boolean dest_pass = false;
+        if (dest) {
+            unixsock_lock(dest);
+            dest_pass = dest->passcred;
+            unixsock_unlock(dest);
+        }
+        if (dest_pass) {
+            struct creds scon;
+            creds_snapshot(sender_p, &scon);
+            explicit.pid = sender_p->pid;
+            explicit.uid = scon.uid;
+            explicit.gid = scon.gid;
+            has_explicit = true;
+            explicit_p = sender_p;
+            process_reserve(explicit_p);
+        }
+    }
+    if (!has_explicit && tmp_nfds == 0)
+        return 0;
+    heap h = heap_locked(get_kernel_heaps());
+    u64 size = sizeof(struct unixsock_scm) + tmp_nfds * sizeof(fdesc);
+    unixsock_scm scm = allocate(h, size);
+    if (!scm) {
+        for (u16 i = 0; i < tmp_nfds; i++)
+            fdesc_put(tmp_fds[i]);
+        if (explicit_p)
+            process_release(explicit_p);
+        return -ENOMEM;
+    }
+    scm->has_cred = has_explicit;
+    scm->cred.p = explicit_p;
+    scm->cred.uid = explicit.uid;
+    scm->cred.gid = explicit.gid;
+    scm->nfds = tmp_nfds;
+    for (u16 i = 0; i < tmp_nfds; i++)
+        scm->fds[i] = tmp_fds[i];
+    *out = scm;
+    return 0;
+}
+
+static sysreturn scm_deliver(unixsock_scm scm, struct msghdr *m, int recv_flags, process receiver,
+                             int *installed_fds, u16 *installed_count, vector dropped, boolean *ctrunc)
+{
+    *ctrunc = false;
+    if (!scm)
+        return 0;
+    if (!m) {
+        for (u16 i = 0; i < scm->nfds; i++)
+            vector_push(dropped, scm->fds[i]);
+        if (scm->has_cred && scm->cred.p)
+            process_release(scm->cred.p);
+        heap h = heap_locked(get_kernel_heaps());
+        deallocate(h, scm, sizeof(*scm) + scm->nfds * sizeof(fdesc));
+        return 0;
+    }
+    context ctx = get_current_context(current_cpu());
+    int local_installed[SCM_MAX_FD];
+    u16 local_count = 0;
+    u64 off = 0;
+    boolean truncated = false;
+    u64 controllen = 0;
+    void *control = 0;
+    sysreturn err = 0;
+    if (context_set_err(ctx)) {
+        for (u16 i = 0; i < local_count; i++)
+            deallocate_fd(receiver, local_installed[i]);
+        for (u16 i = 0; i < scm->nfds; i++)
+            vector_push(dropped, scm->fds[i]);
+        if (scm->has_cred && scm->cred.p)
+            process_release(scm->cred.p);
+        heap h = heap_locked(get_kernel_heaps());
+        deallocate(h, scm, sizeof(*scm) + scm->nfds * sizeof(fdesc));
+        if (installed_count)
+            *installed_count = 0;
+        *ctrunc = false;
+        return -EFAULT;
+    }
+    controllen = m->msg_controllen;
+    control = m->msg_control;
+    if (!control)
+        controllen = 0;
+    if (scm->has_cred) {
+        u64 need = SCM_CMSG_SPACE(sizeof(unix_ucred));
+        if (controllen - off < need) {
+            truncated = true;
+        } else {
+            u8 *cp = (u8 *)control + off;
+            s32 pid = process_visible_pid(scm->cred.p, receiver);
+            *(u32 *)cp = (u32)SCM_CMSG_LEN(sizeof(unix_ucred));
+            *(u32 *)(cp + 4) = 0;
+            *(s32 *)(cp + 8) = SOL_SOCKET;
+            *(s32 *)(cp + 12) = SCM_CREDENTIALS;
+            *(s32 *)(cp + 16) = pid;
+            *(u32 *)(cp + 20) = scm->cred.uid;
+            *(u32 *)(cp + 24) = scm->cred.gid;
+            for (u64 i = 28; i < need; i++)
+                cp[i] = 0;
+            off += need;
+        }
+    }
+    if (scm->nfds) {
+        if (controllen - off < sizeof(unix_cmsghdr)) {
+            truncated = true;
+        } else {
+            u64 remaining = controllen - off;
+            u64 slot = remaining - sizeof(unix_cmsghdr);
+            u64 max_by_space = (slot / 8) * 2;
+            u64 k = MIN((u64)scm->nfds, max_by_space);
+            if (max_by_space == 0 && scm->nfds > 0)
+                truncated = true;
+            for (u16 i = 0; i < k; i++) {
+                u64 newfd = allocate_fd(receiver, scm->fds[i], (recv_flags & MSG_CMSG_CLOEXEC) ? FD_CLOEXEC : 0);
+                if (newfd == INVALID_PHYSICAL) {
+                    truncated = true;
+                    break;
+                }
+                local_installed[local_count++] = (int)newfd;
+            }
+            if (local_count < scm->nfds)
+                truncated = true;
+            if (local_count) {
+                u8 *cp = (u8 *)control + off;
+                *(u32 *)cp = (u32)(sizeof(unix_cmsghdr) + local_count * sizeof(int));
+                *(u32 *)(cp + 4) = 0;
+                *(s32 *)(cp + 8) = SOL_SOCKET;
+                *(s32 *)(cp + 12) = SCM_RIGHTS;
+                for (u16 i = 0; i < local_count; i++)
+                    *(int *)(cp + sizeof(unix_cmsghdr) + i * sizeof(int)) = local_installed[i];
+                u64 need = SCM_CMSG_SPACE(local_count * sizeof(int));
+                for (u64 i = sizeof(unix_cmsghdr) + local_count * sizeof(int); i < need; i++)
+                    cp[i] = 0;
+                off += need;
+            }
+        }
+    }
+    m->msg_controllen = off;
+    err = 0;
+    context_clear_err(ctx);
+    for (u16 i = local_count; i < scm->nfds; i++)
+        vector_push(dropped, scm->fds[i]);
+    if (scm->has_cred && scm->cred.p)
+        process_release(scm->cred.p);
+    for (u16 i = 0; i < local_count; i++) {
+        if (installed_fds)
+            installed_fds[i] = local_installed[i];
+    }
+    if (installed_count)
+        *installed_count = local_count;
+    *ctrunc = truncated;
+    heap h = heap_locked(get_kernel_heaps());
+    deallocate(h, scm, sizeof(*scm) + scm->nfds * sizeof(fdesc));
+    return err;
+}
+
+static fdesc fdesc_peek_noref(process p, int fd)
+{
+    if (fd < 0)
+        return 0;
+    fdtable fdt = p ? p->fdtable : 0;
+    if (!fdt)
+        return 0;
+    spin_lock(&fdt->lock);
+    fdesc f = vector_get(fdt->files, fd);
+    spin_unlock(&fdt->lock);
+    return f;
+}
+
+static void scm_drop_to_vector(unixsock_scm scm, vector dropped)
+{
+    if (!scm)
+        return;
+    if (dropped) {
+        for (u16 i = 0; i < scm->nfds; i++)
+            vector_push(dropped, scm->fds[i]);
+    } else {
+        for (u16 i = 0; i < scm->nfds; i++)
+            fdesc_put(scm->fds[i]);
+    }
+    if (scm->has_cred && scm->cred.p)
+        process_release(scm->cred.p);
+    heap h = heap_locked(get_kernel_heaps());
+    deallocate(h, scm, sizeof(*scm) + scm->nfds * sizeof(fdesc));
+}
+
 static void unixsock_addr_copy(struct sockaddr_un *dest, struct sockaddr_un *src, socklen_t *len)
 {
     sstring addr = sstring_from_cstring(src->sun_path, sizeof(src->sun_path));
@@ -169,17 +593,26 @@ closure_function(9, 1, sysreturn, unixsock_read_bh,
 
     unixsock_msg shb;
     sysreturn rv;
+    vector dropped = 0;
+    int installed_fds[SCM_MAX_FD];
+    u16 installed_count = 0;
+    boolean ctrunc = false;
+    boolean first_set = false;
+    boolean first_has_cred = false;
+    struct unix_cred first_cred = { 0, 0, 0 };
+    boolean seen_rights = false;
+    boolean truncated = false;
+    boolean read_done = false;
+    context ctx = context_from_closure(closure_self());
+    process receiver = is_syscall_context(ctx) ? ((syscall_context)ctx)->t->p : ((process_context)ctx)->p;
 
     unixsock_lock(s);
     boolean disconnected = unixsock_is_conn_oriented(s) && !(s->peer && s->peer->data);
     boolean end_of_data = disconnected || (s->shutdown & UNIXSOCK_RCV_SHUTDOWN);
-    boolean read_done = false;
-    boolean truncated = false;
     if ((flags & BLOCKQ_ACTION_NULLIFY) && !end_of_data) {
         rv = -ERESTARTSYS;
         goto out;
     }
-    context ctx = context_from_closure(closure_self());
     shb = queue_peek(s->data);
     if (shb == INVALID_ADDRESS) {
         if (end_of_data) {
@@ -192,12 +625,36 @@ closure_function(9, 1, sysreturn, unixsock_read_bh,
         unixsock_unlock(s);
         return blockq_block_required((unix_context)ctx, flags);
     }
+    dropped = allocate_vector(heap_locked(get_kernel_heaps()), 8);
+    if (dropped == INVALID_ADDRESS)
+        dropped = 0;
     rv = 0;
     if (context_set_err(ctx)) {
         if (rv == 0)
             rv = -EFAULT;
         else
             read_done = true;
+        if (rv == -EFAULT) {
+            for (u16 i = 0; i < installed_count; i++) {
+                fdesc f = fdesc_peek_noref(receiver, installed_fds[i]);
+                deallocate_fd(receiver, installed_fds[i]);
+                if (f)
+                    vector_push(dropped, f);
+            }
+            installed_count = 0;
+            if (shb != INVALID_ADDRESS && queue_peek(s->data) == shb) {
+                unixsock_msg tofree = dequeue(s->data);
+                u64 rlen = buffer_length(tofree->b);
+                s->sock.rx_len -= MIN(s->sock.rx_len, rlen);
+                if (tofree->scm) {
+                    unixsock_scm scm = tofree->scm;
+                    tofree->scm = 0;
+                    scm_drop_to_vector(scm, dropped);
+                }
+                unixsock_msg_dealloc(tofree);
+                shb = INVALID_ADDRESS;
+            }
+        }
         goto out;
     }
     void *iov_base;
@@ -210,6 +667,21 @@ closure_function(9, 1, sysreturn, unixsock_read_bh,
     }
     u64 buf_offset = 0;
     do {
+        if (first_set) {
+            if (seen_rights)
+                break;
+            if (s->passcred) {
+                boolean cur_has = (shb->scm && shb->scm->has_cred);
+                boolean differs = (cur_has != first_has_cred);
+                if (!differs && cur_has && first_has_cred) {
+                    if (shb->scm->cred.p != first_cred.p || shb->scm->cred.uid != first_cred.uid ||
+                        shb->scm->cred.gid != first_cred.gid)
+                        differs = true;
+                }
+                if (differs)
+                    break;
+            }
+        }
         buffer b = shb->b;
         u64 msg_len = buffer_length(b);
         u64 xfer;
@@ -252,6 +724,66 @@ closure_function(9, 1, sysreturn, unixsock_read_bh,
             if (bound(msgflags) & MSG_TRUNC)
                 rv = msg_len;
         }
+        {
+            unixsock_scm scm = shb->scm;
+            shb->scm = 0;
+            boolean had_rights = (scm && scm->nfds);
+            if (!first_set) {
+                first_set = true;
+                first_has_cred = (scm && scm->has_cred);
+                if (first_has_cred)
+                    first_cred = scm->cred;
+            }
+            if (scm) {
+                boolean this_ctrunc = false;
+                u16 per_call = 0;
+                sysreturn d = scm_deliver(scm, bound(msg), bound(msgflags), receiver,
+                                          installed_fds + installed_count, &per_call, dropped, &this_ctrunc);
+                if (this_ctrunc)
+                    ctrunc = true;
+                if (d == -EFAULT) {
+                    if (queue_peek(s->data) == shb) {
+                        assert(dequeue(s->data) == shb);
+                        s->sock.rx_len -= buffer_length(b);
+                        unixsock_msg_dealloc(shb);
+                        shb = INVALID_ADDRESS;
+                    }
+                    rv = -EFAULT;
+                    break;
+                }
+                installed_count += per_call;
+                if (context_set_err(ctx)) {
+                    if (rv == 0)
+                        rv = -EFAULT;
+                    else
+                        read_done = true;
+                    if (rv == -EFAULT) {
+                        for (u16 i = 0; i < installed_count; i++) {
+                            fdesc f = fdesc_peek_noref(receiver, installed_fds[i]);
+                            deallocate_fd(receiver, installed_fds[i]);
+                            if (f)
+                                vector_push(dropped, f);
+                        }
+                        installed_count = 0;
+                        if (shb != INVALID_ADDRESS && queue_peek(s->data) == shb) {
+                            unixsock_msg tofree = dequeue(s->data);
+                            u64 rlen = buffer_length(tofree->b);
+                            s->sock.rx_len -= MIN(s->sock.rx_len, rlen);
+                            if (tofree->scm) {
+                                unixsock_scm scm2 = tofree->scm;
+                                tofree->scm = 0;
+                                scm_drop_to_vector(scm2, dropped);
+                            }
+                            unixsock_msg_dealloc(tofree);
+                            shb = INVALID_ADDRESS;
+                        }
+                    }
+                    goto out;
+                }
+            }
+            if (had_rights)
+                seen_rights = true;
+        }
         if (!buffer_length(b) || (s->sock.type != SOCK_STREAM)) {
             if (s->sock.type == SOCK_DGRAM) {
                 struct sockaddr_un *from_addr = bound(from_addr);
@@ -270,11 +802,17 @@ closure_function(9, 1, sysreturn, unixsock_read_bh,
         }
     } while ((s->sock.type == SOCK_STREAM) && (length > 0));
     if (bound(msg))
-        bound(msg)->msg_flags = truncated ? MSG_TRUNC : 0;
+        bound(msg)->msg_flags = (truncated ? MSG_TRUNC : 0) | (ctrunc ? MSG_CTRUNC : 0);
     context_clear_err(ctx);
     read_done = true;
 out:
     unixsock_unlock(s);
+    if (dropped) {
+        fdesc f;
+        vector_foreach(dropped, f)
+            fdesc_put(f);
+        deallocate_vector(dropped);
+    }
     if (read_done)
         unixsock_notify_writer(s);
     apply(bound(completion), rv);
@@ -305,13 +843,23 @@ static sysreturn unixsock_write_check(unixsock s, u64 len)
 {
     if ((s->sock.type == SOCK_STREAM) && (len == 0))
         return 0;
-    if ((s->sock.type != SOCK_STREAM) && (len > UNIXSOCK_BUF_MAX_SIZE))
+    if ((s->sock.type != SOCK_STREAM) && (len > (u64)so_rcvbuf))
         return -EMSGSIZE;
     return 1;   /* any value > 0 will do */
 }
 
+static sysreturn unixsock_validate_send_flags(unixsock s, int flags)
+{
+    int allowed = MSG_NOSIGNAL | MSG_DONTWAIT;
+    if (s->sock.type == SOCK_SEQPACKET)
+        allowed |= MSG_EOR;
+    if (flags & ~allowed)
+        return -EOPNOTSUPP;
+    return 0;
+}
+
 static sysreturn unixsock_write_to(void *src, struct iovec *iov, u64 length,
-                                   unixsock dest, unixsock from)
+                                   unixsock dest, unixsock from, unixsock_scm *scm)
 {
     if ((dest->sock.rx_len >= so_rcvbuf) || queue_full(dest->data)) {
         return -EAGAIN;
@@ -342,10 +890,17 @@ static sysreturn unixsock_write_to(void *src, struct iovec *iov, u64 length,
                 rv = check_rv;
             break;
         }
-        xfer = MIN(UNIXSOCK_BUF_MAX_SIZE, xfer);
-        if (from->sock.type == SOCK_STREAM)
+        if (from->sock.type == SOCK_STREAM) {
+            xfer = MIN(UNIXSOCK_BUF_MAX_SIZE, xfer);
             xfer = MIN(xfer, so_rcvbuf - dest->sock.rx_len);
-        unixsock_msg shb = unixsock_msg_alloc(dest->sock.h, xfer);
+        } else {
+            xfer = MIN((u64)so_rcvbuf, xfer);
+        }
+        shb = unixsock_msg_alloc(dest->sock.h, xfer);
+        if (shb != INVALID_ADDRESS && scm && *scm) {
+            shb->scm = *scm;
+            *scm = 0;
+        }
         if (shb == INVALID_ADDRESS) {
             if (rv == 0) {
                 rv = -ENOMEM;
@@ -398,6 +953,7 @@ static sysreturn unixsock_write_to(void *src, struct iovec *iov, u64 length,
         assert(enqueue(dest->data, shb));
         dest->sock.rx_len += xfer;
         rv += xfer;
+        shb = INVALID_ADDRESS;
     } while ((length > 0) && (dest->sock.rx_len < so_rcvbuf) && !queue_full(dest->data));
     context_clear_err(ctx);
     return rv;
@@ -436,9 +992,9 @@ static sysreturn lookup_socket(unixsock *s, struct sockaddr *addr, socklen_t add
     return fss;
 }
 
-closure_function(7, 1, sysreturn, unixsock_write_bh,
+closure_function(8, 1, sysreturn, unixsock_write_bh,
                  unixsock, s, void *, src, struct iovec *, iov, u64, length, io_completion, completion, unixsock, dest,
-                 int, msgflags,
+                 int, msgflags, unixsock_scm, scm,
                  u64 flags)
 {
     unixsock s = bound(s);
@@ -446,6 +1002,7 @@ closure_function(7, 1, sysreturn, unixsock_write_bh,
     u64 length = bound(length);
     unixsock dest;
     boolean full = false;
+    unixsock_scm scm = bound(scm);
 
     sysreturn rv;
 
@@ -467,7 +1024,7 @@ closure_function(7, 1, sysreturn, unixsock_write_bh,
         goto out;
     }
 
-    rv = unixsock_write_to(src, bound(iov), length, dest, s);
+    rv = unixsock_write_to(src, bound(iov), length, dest, s, &scm);
     if ((rv == -EAGAIN) && !(s->sock.f.flags & SOCK_NONBLOCK) && !(bound(msgflags) & MSG_DONTWAIT)) {
         unixsock_unlock(dest);
         return blockq_block_required((unix_context)context_from_closure(closure_self()), flags);
@@ -475,6 +1032,8 @@ closure_function(7, 1, sysreturn, unixsock_write_bh,
     full = (dest->sock.rx_len >= so_rcvbuf) || queue_full(dest->data);
 out:
     unixsock_unlock(dest);
+    if (scm)
+        scm_release(scm);
     if ((rv > 0) || ((rv == 0) && (dest->sock.type != SOCK_STREAM)))
         unixsock_notify_reader(dest);
     if (full)   /* no more space available to write */
@@ -489,10 +1048,26 @@ out:
 
 static sysreturn unixsock_write_with_addr(unixsock s, void *src, u64 length, u64 offset, context ctx,
                                           boolean bh, io_completion completion, unixsock addr,
-                                          int msgflags)
+                                          int msgflags, const struct msghdr *msghdr)
 {
+    sysreturn rv = unixsock_validate_send_flags(s, msgflags);
+    if (rv) {
+        refcount_release(&addr->refcount);
+        return io_complete(completion, rv);
+    }
+    unixsock_scm scm = 0;
+    rv = scm_parse(msghdr, s, addr, &scm);
+    if (rv) {
+        refcount_release(&addr->refcount);
+        return io_complete(completion, rv);
+    }
     blockq_action ba = closure_from_context(ctx, unixsock_write_bh, s, src, 0, length,
-                                            completion, addr, msgflags);
+                                            completion, addr, msgflags, scm);
+    if (ba == INVALID_ADDRESS) {
+        scm_release(scm);
+        refcount_release(&addr->refcount);
+        return io_complete(completion, -ENOMEM);
+    }
     return blockq_check(addr->sock.txbq, ba, bh);
 }
 
@@ -507,7 +1082,7 @@ closure_func_basic(file_io, sysreturn, unixsock_write,
     unixsock_unlock(s);
     if (!dest)
         return io_complete(completion, -ENOTCONN);
-    return unixsock_write_with_addr(s, src, length, offset, ctx, bh, completion, dest, 0);
+    return unixsock_write_with_addr(s, src, length, offset, ctx, bh, completion, dest, 0, 0);
 }
 
 closure_func_basic(file_iov, sysreturn, unixsock_readv,
@@ -522,8 +1097,11 @@ closure_func_basic(file_iov, sysreturn, unixsock_readv,
 }
 
 static sysreturn unixsock_writev_flags(unixsock s, struct iovec *iov, int count, context ctx,
-                                      boolean bh, io_completion completion, int msgflags)
+                                      boolean bh, io_completion completion, int msgflags, const struct msghdr *msghdr)
 {
+    sysreturn rv = unixsock_validate_send_flags(s, msgflags);
+    if (rv)
+        return io_complete(completion, rv);
     unixsock_lock(s);
     unixsock dest = s->peer;
     if (dest)
@@ -531,9 +1109,16 @@ static sysreturn unixsock_writev_flags(unixsock s, struct iovec *iov, int count,
     unixsock_unlock(s);
     if (!dest)
         return io_complete(completion, -ENOTCONN);
+    unixsock_scm scm = 0;
+    rv = scm_parse(msghdr, s, dest, &scm);
+    if (rv) {
+        refcount_release(&dest->refcount);
+        return io_complete(completion, rv);
+    }
     blockq_action ba = closure_from_context(ctx, unixsock_write_bh, s,
-                                            0, iov, count, completion, dest, msgflags);
+                                            0, iov, count, completion, dest, msgflags, scm);
     if (ba == INVALID_ADDRESS) {
+        scm_release(scm);
         refcount_release(&dest->refcount);
         return io_complete(completion, -ENOMEM);
     }
@@ -544,7 +1129,7 @@ closure_func_basic(file_iov, sysreturn, unixsock_writev,
                    struct iovec *iov, int count, u64 offset, context ctx, boolean bh, io_completion completion)
 {
     unixsock s = struct_from_field(closure_self(), unixsock, writev);
-    return unixsock_writev_flags(s, iov, count, ctx, bh, completion, 0);
+    return unixsock_writev_flags(s, iov, count, ctx, bh, completion, 0, 0);
 }
 
 static u32 unixsock_shutdown_events(u8 shutdown)
@@ -664,7 +1249,10 @@ static sysreturn unixsock_listen(struct sock *sock, int backlog)
 {
     unixsock s = (unixsock) sock;
     sysreturn ret = 0;
+    process cur = get_current_thread() ? get_current_thread()->p : 0;
     unixsock_lock(s);
+    if (cur)
+        unixsock_peercred_set_current(s, cur);
     switch (sock->type) {
     case SOCK_STREAM:
     case SOCK_SEQPACKET:
@@ -720,6 +1308,15 @@ closure_function(3, 1, sysreturn, connect_bh,
         rv = -ENOMEM;
         goto out;
     }
+    {
+        struct creds scon;
+        creds_snapshot(t->p, &scon);
+        unixsock_peercred_set(peer, t->p, scon.euid, scon.egid);
+        process lp = listener->peercred.p;
+        u32 luid = listener->peercred.uid;
+        u32 lgid = listener->peercred.gid;
+        unixsock_peercred_set(s, lp, luid, lgid);
+    }
     unixsock_conn_internal(s, peer);
     unixsock_conn_internal(peer, s);
     assert(enqueue(listener->conn_q, peer));
@@ -763,8 +1360,10 @@ static sysreturn unixsock_connect(struct sock *sock, struct sockaddr *addr,
                                                         unixsock_event_handler));
         if (s->notify_handle == INVALID_ADDRESS)
             rv = -ENOMEM;
-        else
+        else {
             unixsock_conn_internal(s, listener);
+            unixsock_peercred_set(s, listener->peercred.p, listener->peercred.uid, listener->peercred.gid);
+        }
         unixsock_unlock(s);
     }
 out:
@@ -865,12 +1464,29 @@ static sysreturn unixsock_setsockopt(struct sock *sock, int level,
                                      int optname, void *optval, socklen_t optlen)
 {
     sysreturn rv;
+    unixsock s = (unixsock)sock;
     switch (level) {
     case SOL_SOCKET:
         switch (optname) {
         case SO_REUSEADDR:
             rv = 0; /* to mimic Linux behavior, return 0 even if not actually implemented */
             break;
+        case SO_PASSCRED: {
+            if (optlen != sizeof(int)) {
+                rv = -EINVAL;
+                break;
+            }
+            int val = 0;
+            if (!copy_from_user(optval, &val, sizeof(val))) {
+                rv = -EFAULT;
+                break;
+            }
+            unixsock_lock(s);
+            s->passcred = (val != 0);
+            unixsock_unlock(s);
+            rv = 0;
+            break;
+        }
         default:
             rv = -EOPNOTSUPP;
         }
@@ -892,8 +1508,10 @@ static sysreturn unixsock_getsockopt(struct sock *sock, int level,
             int l_onoff;
             int l_linger;
         } linger;
+        struct unix_ucred cred;
     } ret_optval;
     int ret_optlen;
+    unixsock s = (unixsock)sock;
 
     switch (level) {
     case SOL_SOCKET:
@@ -902,6 +1520,26 @@ static sysreturn unixsock_getsockopt(struct sock *sock, int level,
             ret_optval.val = sock->type;
             ret_optlen = sizeof(ret_optval.val);
             break;
+        case SO_PASSCRED: {
+            unixsock_lock(s);
+            ret_optval.val = s->passcred ? 1 : 0;
+            unixsock_unlock(s);
+            ret_optlen = sizeof(ret_optval.val);
+            break;
+        }
+        case SO_PEERCRED: {
+            unixsock_lock(s);
+            process p = s->peercred.p;
+            u32 uid = s->peercred.uid;
+            u32 gid = s->peercred.gid;
+            unixsock_unlock(s);
+            process cur = get_current_thread() ? get_current_thread()->p : 0;
+            ret_optval.cred.pid = process_visible_pid(p, cur);
+            ret_optval.cred.uid = uid;
+            ret_optval.cred.gid = gid;
+            ret_optlen = sizeof(ret_optval.cred);
+            break;
+        }
         default:
             goto unimplemented;
         }
@@ -950,7 +1588,7 @@ sysreturn unixsock_sendto(struct sock *sock, void *buf, u64 len, int flags,
         rv = -ENOTCONN;
         goto out;
     }
-    return unixsock_write_with_addr(s, buf, len, 0, ctx, in_bh, completion, dest, flags);
+    return unixsock_write_with_addr(s, buf, len, 0, ctx, in_bh, completion, dest, flags, 0);
 out:
     return io_complete(completion, rv);
 }
@@ -980,7 +1618,7 @@ sysreturn unixsock_sendmsg(struct sock *sock, const struct msghdr *msg,
     if (!memory_is_user(iov, len * sizeof(*iov)))
         page_fault();
     context_clear_err(ctx);
-    return unixsock_writev_flags((unixsock)sock, iov, len, ctx, in_bh, completion, flags);
+    return unixsock_writev_flags((unixsock)sock, iov, len, ctx, in_bh, completion, flags, msg);
 }
 
 sysreturn unixsock_recvmsg(struct sock *sock, struct msghdr *msg, int flags, boolean in_bh,
@@ -1087,6 +1725,10 @@ static unixsock unixsock_alloc(heap h, int type, u32 flags, boolean alloc_fd)
     s->conn_q = 0;
     s->peer = 0;
     s->shutdown = 0;
+    s->passcred = false;
+    s->peercred.p = 0;
+    s->peercred.uid = 0;
+    s->peercred.gid = 0;
     s->notify_handle = INVALID_ADDRESS;
     init_closure_func(&s->free, thunk, unixsock_free);
     init_refcount(&s->refcount, 1, (thunk)&s->free);
@@ -1144,6 +1786,13 @@ sysreturn socketpair(int domain, int type, int protocol, int sv[2]) {
     s2->peer = s1;
     refcount_reserve(&s1->refcount);
     refcount_reserve(&s2->refcount);
+    {
+        process cur = current->p;
+        struct creds c;
+        creds_snapshot(cur, &c);
+        unixsock_peercred_set(s1, cur, c.euid, c.egid);
+        unixsock_peercred_set(s2, cur, c.euid, c.egid);
+    }
     sv[0] = s1->sock.fd;
     sv[1] = s2->sock.fd;
     return 0;
