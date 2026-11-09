@@ -2433,8 +2433,9 @@ static void creds_fix_caps_locked(struct creds *c, u32 old_uid, u32 old_euid, u3
         c->cap_effective |= c->cap_permitted & CAP_FS_SET;
 }
 
-void creds_exec(process p)
+void creds_exec(thread t)
 {
+    process p = t->p;
     process_lock(p);
     struct creds *c = &p->creds;
     u32 root_kid;
@@ -2449,7 +2450,7 @@ void creds_exec(process p)
     } else {
         permitted = effective = c->cap_ambient;
     }
-    if (p->no_new_privs && (permitted & ~old_permitted)) {
+    if (t->no_new_privs && (permitted & ~old_permitted)) {
         permitted &= old_permitted;
         effective &= permitted;
     }
@@ -3087,14 +3088,12 @@ static sysreturn prctl(int option, u64 arg2, u64 arg3, u64 arg4, u64 arg5)
     case PR_SET_NO_NEW_PRIVS:
         if (arg2 != 1 || arg3 || arg4 || arg5)
             return -EINVAL;
-        process_lock(p);
-        p->no_new_privs = true;
-        process_unlock(p);
+        current->no_new_privs = true;
         return 0;
     case PR_GET_NO_NEW_PRIVS:
         if (arg2 || arg3 || arg4 || arg5)
             return -EINVAL;
-        return p->no_new_privs;
+        return current->no_new_privs;
     case PR_CAPBSET_READ:
         if (arg2 > CAP_LAST_CAP)
             return -EINVAL;

@@ -980,7 +980,6 @@ sysreturn fork_process(thread t, struct clone_args_internal *args)
     buffer cmdline = parent->cmdline ? clone_buffer(locked, parent->cmdline) : 0;
     buffer exe = parent->exe ? clone_buffer(locked, parent->exe) : 0;
     boolean creds_ok = creds_copy(&c->creds, &parent->creds);
-    c->no_new_privs = parent->no_new_privs;
     process_unlock(parent);
     if ((cmdline == INVALID_ADDRESS) || (exe == INVALID_ADDRESS) || !creds_ok) {
         if (cmdline && (cmdline != INVALID_ADDRESS))

@@ -439,6 +439,7 @@ typedef struct thread {
     u64 signal_stack_length;
     u8 seccomp_mode;
     seccomp_filter seccomp;
+    boolean no_new_privs;
 
     struct spinlock lock;   /* generic lock for struct members without a specific lock */
 
@@ -641,7 +642,6 @@ typedef struct process {
     thread            vfork_waiter;
     boolean           exiting;
     boolean           dumpable;
-    boolean           no_new_privs;
     int               ptracer;
     int               pdeathsig;
     struct creds      creds;
@@ -1254,7 +1254,7 @@ boolean creds_copy(struct creds *dst, struct creds *src);
 void creds_free(struct creds *c);
 void creds_snapshot(process p, struct creds *c);
 boolean capable(process p, int cap);
-void creds_exec(process p);
+void creds_exec(thread t);
 
 filesystem filesystem_path_root(tuple *root);
 void fs_set_path_root(filesystem (*get_root)(tuple *root));

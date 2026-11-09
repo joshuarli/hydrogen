@@ -581,6 +581,7 @@ thread create_thread(process p, u64 tid)
     t->signal_stack_length = 0;
     t->seccomp_mode = 0;
     t->seccomp = 0;
+    t->no_new_privs = false;
     bitmap affinity = allocate_bitmap(h, h, total_processors);
     if (affinity == INVALID_ADDRESS)
         goto fail_affinity;

@@ -450,7 +450,6 @@ static void procfs_status(buffer b, process p, int tid)
     push_u8(b, '\n');
     u64 inh = c->cap_inheritable, prm = c->cap_permitted, eff = c->cap_effective;
     u64 bnd = c->cap_bset, amb = c->cap_ambient;
-    boolean nnp = p->no_new_privs;
     int pgid = p->pgid;
     process_unlock(p);
     bprintf(b, "NStgid:\t%d\nNSpid:\t%d\nNSpgid:\t%d\nNSsid:\t%d\n", p->pid, tid, pgid, pgid);
@@ -472,8 +471,10 @@ static void procfs_status(buffer b, process p, int tid)
     procfs_cap_line(b, ss("CapAmb"), amb);
     u8 sec_mode = 0;
     u32 sec_filters = 0;
+    boolean nnp = false;
     thread tt = thread_from_tid(p, tid);
     if (tt != INVALID_ADDRESS) {
+        nnp = tt->no_new_privs;
         sec_mode = tt->seccomp_mode;
         sec_filters = seccomp_filter_count(tt->seccomp);
         thread_release(tt);

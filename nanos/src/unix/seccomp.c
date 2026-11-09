@@ -522,11 +522,7 @@ sysreturn seccomp(u32 op, u32 flags, void *uargs)
     if (prog.len == 0 || prog.len > BPF_MAXINSNS)
         return -EINVAL;
     process p = t->p;
-    boolean nnp;
-    process_lock(p);
-    nnp = p->no_new_privs;
-    process_unlock(p);
-    if (!nnp && !capable(p, CAP_SYS_ADMIN))
+    if (!t->no_new_privs && !capable(p, CAP_SYS_ADMIN))
         return -EACCES;
     heap h = heap_locked(get_kernel_heaps());
     u64 byte_len = (u64)prog.len * sizeof(struct sock_filter);
@@ -594,6 +590,8 @@ sysreturn seccomp(u32 op, u32 flags, void *uargs)
             seccomp_filter prev_old = ot->seccomp;
             ot->seccomp = nf;
             ot->seccomp_mode = SECCOMP_MODE_FILTER;
+            if (t->no_new_privs)
+                ot->no_new_privs = true;
             if (prev_old)
                 seccomp_release(prev_old);
         }
@@ -609,6 +607,7 @@ void seccomp_fork(thread child, thread parent)
 {
     child->seccomp_mode = parent->seccomp_mode;
     child->seccomp = parent->seccomp;
+    child->no_new_privs = parent->no_new_privs;
     seccomp_reserve(child->seccomp);
 }
 void seccomp_thread_exit(thread t)

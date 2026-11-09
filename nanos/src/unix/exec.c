@@ -1067,7 +1067,7 @@ static boolean exec_replace_image(thread t, exec_image img, exec_image interp, e
         vm->interp = interp->f;
         interp->f = 0;
     }
-    creds_exec(p);
+    creds_exec(t);
     build_exec_stack(p, t, e, entry, load_range.start, interp_base, aslr, args);
 
     fdtable fdt = fdtable_copy(p->fdtable);
