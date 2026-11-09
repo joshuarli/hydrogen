@@ -55,6 +55,7 @@ suite_harness() {
 		case_verdict seccomp "$smp" 60 PASS '' "$FIXTURES/seccomp"
 		case_verdict seccomp_strace "$smp" 60 PASS '' --klib strace "$FIXTURES/seccomp"
 		case_verdict mmap_bad_fd "$smp" 20 PASS '' "$FIXTURES/mmap_bad_fd"
+		case_verdict scm_rights "$smp" 60 PASS '' "$FIXTURES/scm_rights"
 	done
 	want_frame=' main at .*fixtures/crash.c:' case_verdict crash 1 20 CRASH '' "$FIXTURES/crash"
 	case_verdict silent_exit 1 20 'FAIL detail=missing-record' '' "$FIXTURES/silent_exit"
