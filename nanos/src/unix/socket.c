@@ -343,13 +343,19 @@ static sysreturn scm_parse(const struct msghdr *m, unixsock sender, unixsock des
                     parse_err = -EPERM;
                     break;
                 }
-                boolean uid_ok = (uc.uid == scon.uid || uc.uid == scon.euid || uc.uid == scon.suid);
+                user_namespace sender_ns = process_user_ns(sender_p);
+                boolean uid_ok = (uc.uid == user_ns_from_kuid(sender_ns, scon.uid) ||
+                                  uc.uid == user_ns_from_kuid(sender_ns, scon.euid) ||
+                                  uc.uid == user_ns_from_kuid(sender_ns, scon.suid));
+                boolean gid_ok = (uc.gid == user_ns_from_kgid(sender_ns, scon.gid) ||
+                                  uc.gid == user_ns_from_kgid(sender_ns, scon.egid) ||
+                                  uc.gid == user_ns_from_kgid(sender_ns, scon.sgid));
+                user_ns_release(sender_ns);
                 boolean uid_priv = is_admin || capable(sender_p, CAP_SETUID);
                 if (!uid_ok && !uid_priv) {
                     parse_err = -EPERM;
                     break;
                 }
-                boolean gid_ok = (uc.gid == scon.gid || uc.gid == scon.egid || uc.gid == scon.sgid);
                 boolean gid_priv = is_admin || capable(sender_p, CAP_SETGID);
                 if (!gid_ok && !gid_priv) {
                     parse_err = -EPERM;
@@ -357,6 +363,17 @@ static sysreturn scm_parse(const struct msghdr *m, unixsock sender, unixsock des
                 }
                 if (has_explicit && explicit_p)
                     process_release(explicit_p);
+                {
+                    user_namespace ns2 = process_user_ns(sender_p);
+                    u32 kid_uid, kid_gid;
+                    if (!user_ns_to_kuid(ns2, uc.uid, &kid_uid))
+                        kid_uid = USER_NS_OVERFLOW_ID;
+                    if (!user_ns_to_kgid(ns2, uc.gid, &kid_gid))
+                        kid_gid = USER_NS_OVERFLOW_ID;
+                    user_ns_release(ns2);
+                    uc.uid = kid_uid;
+                    uc.gid = kid_gid;
+                }
                 explicit = uc;
                 has_explicit = true;
                 if (uc.pid == sender_p->pid) {
@@ -475,13 +492,17 @@ static sysreturn scm_deliver(unixsock_scm scm, struct msghdr *m, int recv_flags,
         } else {
             u8 *cp = (u8 *)control + off;
             s32 pid = process_visible_pid(scm->cred.p, receiver);
+            user_namespace receiver_ns = process_user_ns(receiver);
+            u32 local_uid = user_ns_from_kuid(receiver_ns, scm->cred.uid);
+            u32 local_gid = user_ns_from_kgid(receiver_ns, scm->cred.gid);
+            user_ns_release(receiver_ns);
             *(u32 *)cp = (u32)SCM_CMSG_LEN(sizeof(unix_ucred));
             *(u32 *)(cp + 4) = 0;
             *(s32 *)(cp + 8) = SOL_SOCKET;
             *(s32 *)(cp + 12) = SCM_CREDENTIALS;
             *(s32 *)(cp + 16) = pid;
-            *(u32 *)(cp + 20) = scm->cred.uid;
-            *(u32 *)(cp + 24) = scm->cred.gid;
+            *(u32 *)(cp + 20) = local_uid;
+            *(u32 *)(cp + 24) = local_gid;
             for (u64 i = 28; i < need; i++)
                 cp[i] = 0;
             off += need;
@@ -1534,6 +1555,12 @@ static sysreturn unixsock_getsockopt(struct sock *sock, int level,
             u32 gid = s->peercred.gid;
             unixsock_unlock(s);
             process cur = get_current_thread() ? get_current_thread()->p : 0;
+            user_namespace viewer_ns = cur ? process_user_ns(cur) : 0;
+            if (viewer_ns) {
+                uid = user_ns_from_kuid(viewer_ns, uid);
+                gid = user_ns_from_kgid(viewer_ns, gid);
+                user_ns_release(viewer_ns);
+            }
             ret_optval.cred.pid = process_visible_pid(p, cur);
             ret_optval.cred.uid = uid;
             ret_optval.cred.gid = gid;
